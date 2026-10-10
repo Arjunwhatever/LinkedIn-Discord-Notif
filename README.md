@@ -10,6 +10,7 @@ one bot install, many servers, each tracking whatever they want.
   terms of service and can break or get rate-limited/blocked at any time —
   see the warnings in `linkedin_scraper.py`. Keep polling infrequent.
 - **`/announce`**: still there for a one-off manual post of anything.
+- Every post the bot sends (automatic, `/latest-linkedin` or `/announce`) includes the post link, both as the clickable embed title and as a copyable link field.
 
 ## Local setup
 
@@ -32,6 +33,7 @@ Run these once per server (each needs "Manage Server" permission, except `/statu
   existing posts as seen, so only future posts get announced.
 - `/setup-youtube channel_id:UCxxxxxxxx` - start tracking a YouTube channel
   (the channel ID, not the @handle).
+- `/latest-linkedin` - show the most recent post from the tracked page right now (optionally pass a `url` to check any other company page).
 - `/status` - see what's currently configured for this server.
 - `/remove-linkedin` - stop tracking the LinkedIn page (clears its seen-post history too).
 - `/remove-youtube` - stop tracking the YouTube channel (clears its seen-video history too).
