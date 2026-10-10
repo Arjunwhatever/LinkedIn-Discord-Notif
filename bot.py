@@ -20,6 +20,7 @@ at any time (see linkedin_scraper.py). Keep polling infrequent.
 
 import asyncio
 import os
+import re
 import sqlite3
 
 import discord
@@ -192,24 +193,57 @@ def mark_youtube_seen(guild_id: int, video_id: str):
 
 # ---------- helpers ----------
 
-def linkedin_embed(post: dict) -> discord.Embed:
-    text = post.get("text") or ""
-    snippet = text[:500] + ("…" if len(text) > 500 else "")
+_LEAD_RE = re.compile(r"^.{0,120}?[\d,]+\s+followers\s+\S+\s+(?:Edited\s+)?Report this post\s+", re.S)
+_TAIL_RE = re.compile(r"\s*(?:\u2026more)?(?:\s+[\d,]+)*(?:\s+Comments?)?\s+Like\s+Comment\s+Share\s*$")
+
+
+def clean_post_text(text: str) -> str:
+    """Strip LinkedIn page chrome ("Google 42M followers 1d Report this post ... Like Comment Share")."""
+    text = _LEAD_RE.sub("", text or "", count=1)
+    text = _TAIL_RE.sub("", text)
+    return text.strip()
+
+
+def usable_posts(posts: list) -> list:
+    """Drop entries with no text and no usable url (raw-HTML fallback duplicates)."""
+    return [p for p in posts if p.get("url") and (p.get("text") or "").strip()]
+
+
+def newest_post(posts: list):
+    posts = usable_posts(posts)
+    if not posts:
+        return None
+    dated = [p for p in posts if re.match(r"\d{4}-\d{2}-\d{2}", p.get("published") or "")]
+    if dated:
+        return max(dated, key=lambda p: p["published"])
+    return posts[0]
+
+
+def linkedin_embed(post: dict, title: str = "\U0001f4bc New LinkedIn post") -> discord.Embed:
+    text = clean_post_text(post.get("text") or "")
+    snippet = text[:500] + ("\u2026" if len(text) > 500 else "")
+    url = post.get("url")
     embed = discord.Embed(
-        title="💼 New LinkedIn post",
+        title=title,
         description=snippet or "(no caption)",
-        url=post.get("url"),
+        url=url,
         color=discord.Color.blue(),
     )
+    if url:
+        embed.add_field(name="\U0001f517 Post link", value=url, inline=False)
+    if post.get("published"):
+        embed.set_footer(text=f"Published {post['published']}")
     return embed
 
 
 def youtube_embed(entry) -> discord.Embed:
-    return discord.Embed(
-        title=f"📺 New upload: {entry.title}",
+    embed = discord.Embed(
+        title=f"\U0001f4fa New upload: {entry.title}",
         url=entry.link,
         color=discord.Color.red(),
     )
+    embed.add_field(name="\U0001f517 Video link", value=entry.link, inline=False)
+    return embed
 
 
 def fetch_youtube_entries(yt_channel_id: str):
@@ -246,7 +280,7 @@ async def setup_linkedin(interaction: discord.Interaction, url: str):
     set_linkedin_url(interaction.guild_id, url)
 
     try:
-        posts = await asyncio.to_thread(fetch_posts, url)
+        posts = usable_posts(await asyncio.to_thread(fetch_posts, url))
     except LinkedInBlocked as e:
         await interaction.followup.send(
             f"Saved the URL, but the first fetch was blocked by LinkedIn ({e}). "
@@ -339,6 +373,7 @@ async def announce(
         title=f"{emoji} New {platform.value} post", description=note or "", url=url,
         color=discord.Color.blue(),
     )
+    embed.add_field(name="\U0001f517 Link", value=url, inline=False)
     await channel.send(embed=embed)
     await interaction.response.send_message("✅ Posted!", ephemeral=True)
 
@@ -363,6 +398,55 @@ async def remove_youtube(interaction: discord.Interaction):
         return
     clear_youtube(interaction.guild_id)
     await interaction.response.send_message("✅ Stopped tracking YouTube for this server.", ephemeral=True)
+
+
+@bot.tree.command(name="latest-linkedin", description="Show the most recent post from the tracked LinkedIn page")
+@app_commands.describe(url="Optional: a different company page URL (defaults to this server's tracked page)")
+async def latest_linkedin(interaction: discord.Interaction, url: str = None):
+    cfg = get_guild_config(interaction.guild_id)
+    target = url or (cfg["linkedin_url"] if cfg else None)
+    if not target:
+        await interaction.response.send_message(
+            "No LinkedIn page is tracked yet. Run `/setup-linkedin` first, or pass a `url`.",
+            ephemeral=True,
+        )
+        return
+    if "linkedin.com/company/" not in target:
+        await interaction.response.send_message(
+            "Expecting a company page URL like `https://www.linkedin.com/company/<slug>/`.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    try:
+        posts = await asyncio.to_thread(fetch_posts, target)
+    except LinkedInBlocked as e:
+        await interaction.followup.send(f"LinkedIn blocked the request ({e}). Try again later.", ephemeral=True)
+        return
+    except Exception as e:
+        await interaction.followup.send(f"Couldn't fetch the page: {e}", ephemeral=True)
+        return
+
+    post = newest_post(posts)
+    if post is None:
+        await interaction.followup.send(
+            "Fetched the page but found no posts \u2014 LinkedIn may be hiding them from logged-out visitors.",
+            ephemeral=True,
+        )
+        return
+
+    embed = linkedin_embed(post, title="\U0001f4bc Latest LinkedIn post")
+    # Post as a regular message in the channel (not a reply to the command), with the link
+    # on its own line. <...> stops Discord adding a second, usually empty, LinkedIn preview.
+    try:
+        await interaction.channel.send(content=f"\U0001f517 <{post['url']}>", embed=embed)
+    except discord.Forbidden:
+        await interaction.followup.send(
+            "I don't have permission to send messages in this channel.", ephemeral=True
+        )
+        return
+    await interaction.followup.send("\u2705 Posted the latest LinkedIn post in this channel.", ephemeral=True)
 
 
 @bot.tree.command(name="status", description="Show this server's announcement configuration")
@@ -404,7 +488,7 @@ async def poll_linkedin():
         url = cfg["linkedin_url"]
         if url not in page_cache:
             try:
-                page_cache[url] = await asyncio.to_thread(fetch_posts, url)
+                page_cache[url] = usable_posts(await asyncio.to_thread(fetch_posts, url))
             except LinkedInBlocked as e:
                 print(f"LinkedIn blocked for {url}: {e}")
                 page_cache[url] = []
